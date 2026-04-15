@@ -7,130 +7,106 @@ const fs = require('fs');
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'public')));
 
-// Load private key
-let PRIVATE_KEY;
-if (process.env.PRIVATE_KEY) {
-  PRIVATE_KEY = process.env.PRIVATE_KEY.replace(/\\n/g, '\n');
-  console.log('✅ Private key loaded from environment');
-} else {
-  try {
-    PRIVATE_KEY = fs.readFileSync(path.join(__dirname, 'private.key'), 'utf8');
-    console.log('✅ Private key loaded from file');
-  } catch (err) {
-    console.error('❌ No private key found!');
-    process.exit(1);
+// ─────────────────────────────────────────
+// CONFIG — All settings in one place
+// ─────────────────────────────────────────
+const CONFIG = {
+  freshservice_url: 'https://nive-959766391470843394.myfreshworks.com',
+
+  // Agents: email → { password, workspace }
+  agents: {
+    'niveditha@oskloud.com': { password: 'Nivedemo@1234', workspace: 'amazon' },
+    'nivetestfw@gmail.com':  { password: 'Nivedemo@1234', workspace: 'netflix' }
   }
-}
-
-const FRESHSERVICE_REDIRECT_URL = 'https://nive-959766391470843394.myfreshworks.com/sp/OIDC/964459105499003173/implicit';
-
-const AGENTS = {
-  'niveditha@oskloud.com': { password: 'Nivedemo@1234', workspace: 'amazon' },
-  'nivetestfw@gmail.com':  { password: 'Nivedemo@1234', workspace: 'netflix' }
 };
 
-// Store state+nonce in memory temporarily
-const pendingSessions = {};
-
-// Helper — serve HTML with state+nonce injected
-function serveHtml(res, filename, state, nonce) {
-  const filePath = path.join(__dirname, 'public', filename);
-  let html = fs.readFileSync(filePath, 'utf8');
-  html = html.replace(
-    '<!-- STATE_NONCE_PLACEHOLDER -->',
-    `<input type="hidden" name="state" value="${state || ''}"/>
-     <input type="hidden" name="nonce" value="${nonce || ''}"/>`
-  );
-  res.send(html);
+// Load RSA private key
+let PRIVATE_KEY;
+try {
+  PRIVATE_KEY = process.env.PRIVATE_KEY
+    ? process.env.PRIVATE_KEY.replace(/\\n/g, '\n')
+    : fs.readFileSync(path.join(__dirname, 'private.key'), 'utf8');
+  console.log('✅ Private key loaded successfully');
+} catch (err) {
+  console.error('❌ Private key not found!');
+  process.exit(1);
 }
 
-// Routes
-app.get('/', (req, res) => {
-  const { state, nonce } = req.query;
-  console.log(`[ROOT] state=${state} nonce=${nonce}`);
-  // Store for later use
-  if (state) pendingSessions[state] = { nonce, portal: 'amazon' };
-  serveHtml(res, 'amazon.html', state, nonce);
-});
+// ─────────────────────────────────────────
+// ROUTES
+// ─────────────────────────────────────────
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'amazon.html')));
+app.get('/amazon', (req, res) => res.sendFile(path.join(__dirname, 'public', 'amazon.html')));
+app.get('/netflix', (req, res) => res.sendFile(path.join(__dirname, 'public', 'netflix.html')));
 
-app.get('/amazon', (req, res) => {
-  const { state, nonce } = req.query;
-  console.log(`[AMAZON] state=${state} nonce=${nonce}`);
-  // Store state+nonce so login can retrieve them
-  if (state) pendingSessions[state] = { nonce, portal: 'amazon' };
-  serveHtml(res, 'amazon.html', state, nonce);
-});
-
-app.get('/netflix', (req, res) => {
-  const { state, nonce } = req.query;
-  console.log(`[NETFLIX] state=${state} nonce=${nonce}`);
-  if (state) pendingSessions[state] = { nonce, portal: 'netflix' };
-  serveHtml(res, 'netflix.html', state, nonce);
-});
-
-// Login
+// ─────────────────────────────────────────
+// LOGIN — JWT Generation + Portal Restriction
+// ─────────────────────────────────────────
 app.post('/login', (req, res) => {
-  let { email, password, portal, state, nonce } = req.body;
-
-  // Try to recover state+nonce from memory if missing
-  if (state && pendingSessions[state]) {
-    const session = pendingSessions[state];
-    if (!nonce) nonce = session.nonce;
-    if (!portal) portal = session.portal;
-    delete pendingSessions[state]; // cleanup
-  }
-
-  console.log(`[LOGIN] email=${email} portal=${portal} state=${state} nonce=${nonce}`);
+  const { email, password, portal } = req.body;
 
   if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required.' });
+    return res.status(400).json({ success: false, error: 'Email and password are required.' });
   }
 
   const agentKey = email.toLowerCase().trim();
-  const agent = AGENTS[agentKey];
+  const agent = CONFIG.agents[agentKey];
 
+  // Agent does not exist
   if (!agent) {
-    return res.status(401).json({ error: 'Invalid email or password.' });
+    return res.status(401).json({ success: false, error: 'Invalid email or password.' });
   }
 
+  // Wrong password
   if (agent.password !== password) {
-    return res.status(401).json({ error: 'Invalid email or password.' });
+    return res.status(401).json({ success: false, error: 'Invalid email or password.' });
   }
 
+  // ✅ PORTAL RESTRICTION — Netflix agent cannot login via Amazon page
   if (portal && agent.workspace !== portal) {
     return res.status(403).json({
-      error: `Access denied. You are not authorised for the ${portal} portal.`
+      success: false,
+      error: `Access denied. You are not an agent for the ${portal} portal.`
     });
   }
 
+  // Build JWT
   const now = Math.floor(Date.now() / 1000);
   const payload = {
     sub: agentKey,
     email: agentKey,
     iat: now,
     exp: now + 300,
-    nonce: nonce || uuidv4()
+    jti: uuidv4()
   };
 
+  // Sign JWT
   let token;
   try {
     token = jwt.sign(payload, PRIVATE_KEY, { algorithm: 'RS256' });
   } catch (err) {
     console.error('JWT signing error:', err.message);
-    return res.status(500).json({ error: 'Authentication error. Contact admin.' });
+    return res.status(500).json({ success: false, error: 'Authentication error. Please contact admin.' });
   }
 
-  // MUST send back state that Freshworks originally sent
-  const redirectUrl = `${FRESHSERVICE_REDIRECT_URL}?id_token=${token}&state=${state || portal}`;
-  console.log(`[REDIRECT] state=${state} nonce=${nonce}`);
+  // ✅ Direct JWT login — bypasses OIDC, goes straight to dashboard
+  const redirectUrl = `${CONFIG.freshservice_url}/login/jwt?jwt=${token}`;
 
+  console.log(`✅ Login success: ${agentKey} → ${portal} portal`);
   return res.json({ success: true, redirectUrl });
 });
 
+// Health check
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
+// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ SSO Portal running on port ${PORT}`);
+  console.log(`
+✅ Freshservice SSO Portal running!
+🟠 Amazon → http://localhost:${PORT}/amazon
+🔴 Netflix → http://localhost:${PORT}/netflix
+  `);
 });
