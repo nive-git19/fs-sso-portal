@@ -24,6 +24,7 @@ if (process.env.PRIVATE_KEY) {
   }
 }
 
+const FRESHSERVICE_URL = 'https://nive-959766391470843394.myfreshworks.com';
 const OIDC_REDIRECT_URL = 'https://nive-959766391470843394.myfreshworks.com/sp/OIDC/964459105499003173/implicit';
 
 // ─────────────────────────────────────────
@@ -46,7 +47,6 @@ const AGENTS = {
 
 // ─────────────────────────────────────────
 // Helper: render branded portal page with state/nonce as hidden inputs
-// state and nonce now travel WITH the user in the form, immune to cold starts
 // ─────────────────────────────────────────
 function renderPortalPage(req, res, htmlFileName, portalName) {
   const state = req.query.state || '';
@@ -57,10 +57,6 @@ function renderPortalPage(req, res, htmlFileName, portalName) {
   console.log(`  state    = ${state}`);
   console.log(`  nonce    = ${nonce}`);
   console.log(`  client_id= ${clientId}`);
-
-  if (!state || !nonce) {
-    console.warn(`[${portalName.toUpperCase()}] ⚠️ Missing state or nonce — user may have visited directly`);
-  }
 
   const filePath = path.join(__dirname, 'public', htmlFileName);
   let html = fs.readFileSync(filePath, 'utf8');
@@ -78,12 +74,33 @@ function renderPortalPage(req, res, htmlFileName, portalName) {
 
 // ─────────────────────────────────────────
 // Branded portal routes
+// 
+// If state & nonce are present → show the branded login page
+// If missing → redirect to Freshservice to get them
+//   (Freshservice auto-redirects back when JWT SSO is the only login method)
 // ─────────────────────────────────────────
-app.get('/amazon', (req, res) => renderPortalPage(req, res, 'amazon.html', 'amazon'));
-app.get('/netflix', (req, res) => renderPortalPage(req, res, 'netflix.html', 'netflix'));
+app.get('/amazon', (req, res) => {
+  if (req.query.state && req.query.nonce) {
+    return renderPortalPage(req, res, 'amazon.html', 'amazon');
+  }
+  console.log('[AMAZON] No OIDC params → redirecting to Freshservice');
+  res.redirect(FRESHSERVICE_URL);
+});
 
-// Default route → Amazon (or change as needed)
-app.get('/', (req, res) => renderPortalPage(req, res, 'amazon.html', 'amazon'));
+app.get('/netflix', (req, res) => {
+  if (req.query.state && req.query.nonce) {
+    return renderPortalPage(req, res, 'netflix.html', 'netflix');
+  }
+  console.log('[NETFLIX] No OIDC params → redirecting to Freshservice');
+  res.redirect(FRESHSERVICE_URL);
+});
+
+app.get('/', (req, res) => {
+  if (req.query.state && req.query.nonce) {
+    return renderPortalPage(req, res, 'amazon.html', 'amazon');
+  }
+  res.redirect(FRESHSERVICE_URL);
+});
 
 // ─────────────────────────────────────────
 // POST /login — authenticate and redirect to Freshworks with signed JWT
@@ -95,11 +112,9 @@ app.post('/login', (req, res) => {
   console.log(`  state=${state}`);
   console.log(`  nonce=${nonce}`);
 
-  // ─────────────────────────────────────
-  // GUARD 1: state and nonce MUST be present (no silent fallbacks)
-  // ─────────────────────────────────────
+  // GUARD 1: state and nonce MUST be present
   if (!state || !nonce) {
-    console.error('[LOGIN] ❌ Missing state or nonce in form submission');
+    console.error('[LOGIN] ❌ Missing state or nonce');
     return res.status(400).send(`
       <!DOCTYPE html>
       <html><head><title>Session Error</title>
@@ -107,26 +122,18 @@ app.post('/login', (req, res) => {
       h2{color:#FF9900}a{color:#FF9900}</style></head>
       <body>
         <h2>Session expired or invalid entry</h2>
-        <p>The login session is missing required parameters. This usually means:</p>
-        <ul>
-          <li>You visited this page directly instead of being redirected from Freshworks</li>
-          <li>Your session expired (more than 10 minutes since the redirect)</li>
-        </ul>
-        <p>Please start over by going to your Freshworks login URL.</p>
+        <p>The login session is missing required parameters.</p>
+        <p><a href="${FRESHSERVICE_URL}">→ Click here to start login</a></p>
       </body></html>
     `);
   }
 
-  // ─────────────────────────────────────
   // GUARD 2: credentials must be provided
-  // ─────────────────────────────────────
   if (!email || !password) {
     return res.status(400).send('Email and password are required.');
   }
 
-  // ─────────────────────────────────────
   // GUARD 3: agent must exist and password must match
-  // ─────────────────────────────────────
   const agentKey = email.toLowerCase().trim();
   const agent = AGENTS[agentKey];
 
@@ -144,9 +151,7 @@ app.post('/login', (req, res) => {
     `);
   }
 
-  // ─────────────────────────────────────
-  // GUARD 4: portal exclusivity — agent must belong to this portal
-  // ─────────────────────────────────────
+  // GUARD 4: portal exclusivity
   if (portal && agent.workspace !== portal) {
     console.warn(`[LOGIN] ❌ Agent ${agentKey} (${agent.workspace}) tried to access ${portal} portal`);
     return res.status(403).send(`
@@ -162,10 +167,7 @@ app.post('/login', (req, res) => {
     `);
   }
 
-  // ─────────────────────────────────────
-  // Build JWT payload — exactly what Freshworks documents as required
-  // sub, email, iat, nonce, given_name, family_name
-  // ─────────────────────────────────────
+  // Build JWT payload
   const now = Math.floor(Date.now() / 1000);
   const payload = {
     sub: agentKey,
@@ -173,14 +175,12 @@ app.post('/login', (req, res) => {
     given_name: agent.given_name,
     family_name: agent.family_name,
     iat: now,
-    nonce: nonce   // ← echo back EXACTLY what Freshworks sent. NO fallback.
+    nonce: nonce
   };
 
   console.log('[LOGIN] JWT payload:', JSON.stringify(payload));
 
-  // ─────────────────────────────────────
-  // Sign JWT with RS256
-  // ─────────────────────────────────────
+  // Sign JWT
   let token;
   try {
     token = jwt.sign(payload, PRIVATE_KEY, { algorithm: 'RS256' });
@@ -189,26 +189,16 @@ app.post('/login', (req, res) => {
     return res.status(500).send('Authentication error. Please contact support.');
   }
 
-  // ─────────────────────────────────────
-  // Redirect to Freshworks with state (in URL) and id_token (the JWT)
-  // Format matches Freshworks docs: ?state=X&id_token=JWT
-  // ─────────────────────────────────────
+  // Redirect to Freshworks OIDC endpoint
   const redirectUrl = `${OIDC_REDIRECT_URL}?state=${encodeURIComponent(state)}&id_token=${token}`;
   console.log(`[LOGIN] ✅ Redirecting to Freshworks for ${agentKey}`);
-  console.log(`  Redirect URL length: ${redirectUrl.length} chars`);
 
-  // 302 redirect — keeps browser navigation in one chain, preserves cookies
   return res.redirect(302, redirectUrl);
 });
 
-// ─────────────────────────────────────────
-// Health check (for UptimeRobot pinger to keep Render warm)
-// ─────────────────────────────────────────
+// Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
-// ─────────────────────────────────────────
-// Start server
-// ─────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ SSO Portal running on port ${PORT}`);
