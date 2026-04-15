@@ -7,106 +7,146 @@ const fs = require('fs');
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname, 'public')));
 
-// ─────────────────────────────────────────
-// CONFIG — All settings in one place
-// ─────────────────────────────────────────
-const CONFIG = {
-  freshservice_url: 'https://testott.freshservice.com',
-
-  // Agents: email → { password, workspace }
-  agents: {
-    'niveditha@oskloud.com': { password: 'Nivedemo@1234', workspace: 'amazon' },
-    'nivetestfw@gmail.com':  { password: 'Nivedemo@1234', workspace: 'netflix' }
-  }
-};
-
-// Load RSA private key
+// Load private key
 let PRIVATE_KEY;
-try {
-  PRIVATE_KEY = process.env.PRIVATE_KEY
-    ? process.env.PRIVATE_KEY.replace(/\\n/g, '\n')
-    : fs.readFileSync(path.join(__dirname, 'private.key'), 'utf8');
-  console.log('✅ Private key loaded successfully');
-} catch (err) {
-  console.error('❌ Private key not found!');
-  process.exit(1);
+if (process.env.PRIVATE_KEY) {
+  PRIVATE_KEY = process.env.PRIVATE_KEY.replace(/\\n/g, '\n');
+  console.log('✅ Private key loaded from environment');
+} else {
+  try {
+    PRIVATE_KEY = fs.readFileSync(path.join(__dirname, 'private.key'), 'utf8');
+    console.log('✅ Private key loaded from file');
+  } catch (err) {
+    console.error('❌ No private key found!');
+    process.exit(1);
+  }
 }
 
 // ─────────────────────────────────────────
-// ROUTES
+// CONFIG — as per official Freshworks docs
 // ─────────────────────────────────────────
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'amazon.html')));
-app.get('/amazon', (req, res) => res.sendFile(path.join(__dirname, 'public', 'amazon.html')));
-app.get('/netflix', (req, res) => res.sendFile(path.join(__dirname, 'public', 'netflix.html')));
+const OIDC_REDIRECT_URL = 'https://nive-959766391470843394.myfreshworks.com/sp/OIDC/964459105499003173/implicit';
+
+const AGENTS = {
+  'niveditha@oskloud.com': {
+    password: 'Nivedemo@1234',
+    workspace: 'amazon',
+    given_name: 'Niveditha',
+    family_name: 'Agent'
+  },
+  'nivetestfw@gmail.com': {
+    password: 'Nivedemo@1234',
+    workspace: 'netflix',
+    given_name: 'Netflix',
+    family_name: 'Agent'
+  }
+};
+
+// Store state+nonce from Freshworks in memory
+const sessions = {};
 
 // ─────────────────────────────────────────
-// LOGIN — JWT Generation + Portal Restriction
+// HELPER — Inject state+nonce into HTML
+// ─────────────────────────────────────────
+function serveHtml(res, filename, state, nonce) {
+  const filePath = path.join(__dirname, 'public', filename);
+  let html = fs.readFileSync(filePath, 'utf8');
+  html = html.replace(
+    '<!-- STATE_NONCE_PLACEHOLDER -->',
+    `<input type="hidden" name="state" value="${state || ''}"/>
+     <input type="hidden" name="nonce" value="${nonce || ''}"/>`
+  );
+  res.send(html);
+}
+
+// ─────────────────────────────────────────
+// ROUTES — capture state+nonce when
+// Freshworks redirects to our auth URL
+// ─────────────────────────────────────────
+app.get('/', (req, res) => {
+  const { state, nonce } = req.query;
+  if (state) sessions[state] = nonce;
+  serveHtml(res, 'amazon.html', state, nonce);
+});
+
+app.get('/amazon', (req, res) => {
+  const { state, nonce } = req.query;
+  console.log(`[AMAZON] state=${state} nonce=${nonce}`);
+  if (state) sessions[state] = nonce;
+  serveHtml(res, 'amazon.html', state, nonce);
+});
+
+app.get('/netflix', (req, res) => {
+  const { state, nonce } = req.query;
+  console.log(`[NETFLIX] state=${state} nonce=${nonce}`);
+  if (state) sessions[state] = nonce;
+  serveHtml(res, 'netflix.html', state, nonce);
+});
+
+// ─────────────────────────────────────────
+// POST /login — validate + sign JWT
 // ─────────────────────────────────────────
 app.post('/login', (req, res) => {
-  const { email, password, portal } = req.body;
+  let { email, password, portal, state, nonce } = req.body;
+
+  // Recover nonce from session storage if not in form
+  if (state && sessions[state] && !nonce) {
+    nonce = sessions[state];
+  }
+
+  console.log(`[LOGIN] email=${email} portal=${portal} state=${state} nonce=${nonce}`);
 
   if (!email || !password) {
-    return res.status(400).json({ success: false, error: 'Email and password are required.' });
+    return res.status(400).json({ error: 'Email and password are required.' });
   }
 
   const agentKey = email.toLowerCase().trim();
-  const agent = CONFIG.agents[agentKey];
+  const agent = AGENTS[agentKey];
 
-  // Agent does not exist
   if (!agent) {
-    return res.status(401).json({ success: false, error: 'Invalid email or password.' });
+    return res.status(401).json({ error: 'Invalid email or password.' });
   }
 
-  // Wrong password
   if (agent.password !== password) {
-    return res.status(401).json({ success: false, error: 'Invalid email or password.' });
+    return res.status(401).json({ error: 'Invalid email or password.' });
   }
 
-  // ✅ PORTAL RESTRICTION — Netflix agent cannot login via Amazon page
   if (portal && agent.workspace !== portal) {
     return res.status(403).json({
-      success: false,
       error: `Access denied. You are not an agent for the ${portal} portal.`
     });
   }
 
-  // Build JWT
+  // Build JWT payload — as per official Freshworks docs
   const now = Math.floor(Date.now() / 1000);
   const payload = {
     sub: agentKey,
     email: agentKey,
+    given_name: agent.given_name,   // ✅ Required by Freshworks
+    family_name: agent.family_name, // ✅ Required by Freshworks
     iat: now,
     exp: now + 300,
-    jti: uuidv4()
+    nonce: nonce || uuidv4()        // ✅ MUST be the nonce from Freshworks
   };
 
-  // Sign JWT
   let token;
   try {
     token = jwt.sign(payload, PRIVATE_KEY, { algorithm: 'RS256' });
   } catch (err) {
     console.error('JWT signing error:', err.message);
-    return res.status(500).json({ success: false, error: 'Authentication error. Please contact admin.' });
+    return res.status(500).json({ error: 'Authentication error.' });
   }
 
-  // ✅ Direct JWT login — bypasses OIDC, goes straight to dashboard
-  const redirectUrl = `${CONFIG.freshservice_url}/login/jwt?jwt=${token}`;
+  // Redirect back to Freshworks OIDC endpoint
+  // Format: OIDC_URL?state=STATE&id_token=JWT
+  const redirectUrl = `${OIDC_REDIRECT_URL}?state=${state || portal}&id_token=${token}`;
+  console.log(`[REDIRECT] state=${state} nonce=${nonce}`);
 
-  console.log(`✅ Login success: ${agentKey} → ${portal} portal`);
   return res.json({ success: true, redirectUrl });
 });
 
-// Health check
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
 
-// Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`
-✅ Freshservice SSO Portal running!
-🟠 Amazon → http://localhost:${PORT}/amazon
-🔴 Netflix → http://localhost:${PORT}/netflix
-  `);
-});
+app.listen(PORT, () => console.log(`✅ SSO Portal running on port ${PORT}`));
