@@ -2,6 +2,9 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
 
 const app = express();
 app.use(express.json());
@@ -28,7 +31,7 @@ const FRESHSERVICE_URL = 'https://nive-959766391470843394.myfreshworks.com';
 const OIDC_REDIRECT_URL = 'https://nive-959766391470843394.myfreshworks.com/sp/OIDC/964459105499003173/implicit';
 
 // ─────────────────────────────────────────
-// Agent whitelist (server-side enforcement)
+// Agent whitelist
 // ─────────────────────────────────────────
 const AGENTS = {
   'niveditha@oskloud.com': {
@@ -46,128 +49,171 @@ const AGENTS = {
 };
 
 // ─────────────────────────────────────────
-// Helper: render branded portal page with state/nonce as hidden inputs
+// Helper: fetch OIDC state + nonce from Freshservice (server-side)
+//
+// How it works:
+// 1. Server makes HTTP GET to Freshservice URL
+// 2. Freshservice sees no session → redirects to our Authorization URL
+//    with ?client_id=...&state=...&nonce=...
+// 3. We intercept that redirect (don't follow it to our own server)
+//    and extract state + nonce from the Location header
 // ─────────────────────────────────────────
-function renderPortalPage(req, res, htmlFileName, portalName) {
-  const state = req.query.state || '';
-  const nonce = req.query.nonce || '';
-  const clientId = req.query.client_id || '';
+function fetchOIDCParams() {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('Timeout')), 15000);
 
-  console.log(`[${portalName.toUpperCase()}] Incoming request`);
-  console.log(`  state    = ${state}`);
-  console.log(`  nonce    = ${nonce}`);
-  console.log(`  client_id= ${clientId}`);
+    function follow(url, depth) {
+      if (depth > 15) { clearTimeout(timer); return reject(new Error('Too many redirects')); }
 
-  const filePath = path.join(__dirname, 'public', htmlFileName);
-  let html = fs.readFileSync(filePath, 'utf8');
+      const parsed = new URL(url);
+      const client = parsed.protocol === 'https:' ? https : http;
 
-  // Inject state, nonce, and portal as hidden form fields
-  html = html.replace(
-    '<!-- SESSION_PLACEHOLDER -->',
-    `<input type="hidden" name="state" value="${state}"/>
-     <input type="hidden" name="nonce" value="${nonce}"/>
-     <input type="hidden" name="portal" value="${portalName}"/>`
-  );
+      const req = client.get(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        },
+        timeout: 10000
+      }, (res) => {
+        // If redirect, check if it points to our auth URL with state/nonce
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          const loc = res.headers.location;
+          res.resume(); // drain response
 
-  res.send(html);
+          // Check if this redirect contains our OIDC params
+          try {
+            const locUrl = loc.startsWith('http') ? new URL(loc) : new URL(loc, url);
+            const state = locUrl.searchParams.get('state');
+            const nonce = locUrl.searchParams.get('nonce');
+
+            if (state && nonce) {
+              clearTimeout(timer);
+              console.log('[OIDC] ✅ Got params from redirect Location header');
+              return resolve({ state, nonce });
+            }
+
+            // Not our target redirect — follow it
+            return follow(locUrl.href, depth + 1);
+          } catch (e) {
+            // If URL parse fails on relative URL, try resolving
+            const next = loc.startsWith('http') ? loc : new URL(loc, url).href;
+            return follow(next, depth + 1);
+          }
+        }
+
+        // Not a redirect — check response body for state/nonce
+        // (some Freshworks flows use JS/meta redirects)
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          clearTimeout(timer);
+
+          // Try to find state and nonce in the body (JS redirect, meta refresh, or form)
+          const stateMatch = body.match(/[?&]state=([^&"'\s<>]+)/);
+          const nonceMatch = body.match(/[?&]nonce=([^&"'\s<>]+)/);
+
+          if (stateMatch && nonceMatch) {
+            console.log('[OIDC] ✅ Got params from response body');
+            return resolve({ state: stateMatch[1], nonce: nonceMatch[1] });
+          }
+
+          // Also check for window.location or href patterns
+          const hrefMatch = body.match(/href=["'][^"']*[?&]state=([^&"']+)[^"']*[?&]nonce=([^&"']+)/);
+          if (hrefMatch) {
+            console.log('[OIDC] ✅ Got params from href in body');
+            return resolve({ state: hrefMatch[1], nonce: hrefMatch[2] });
+          }
+
+          console.error('[OIDC] ❌ Could not find state/nonce. Status:', res.statusCode);
+          console.error('[OIDC] Body preview:', body.substring(0, 500));
+          reject(new Error('Could not extract OIDC params'));
+        });
+      });
+
+      req.on('error', (err) => { clearTimeout(timer); reject(err); });
+      req.on('timeout', () => { req.destroy(); clearTimeout(timer); reject(new Error('Request timeout')); });
+    }
+
+    follow(FRESHSERVICE_URL, 0);
+  });
 }
 
 // ─────────────────────────────────────────
-// Branded portal routes
-// 
-// If state & nonce are present → show the branded login page
-// If missing → redirect to Freshservice to get them
-//   (Freshservice auto-redirects back when JWT SSO is the only login method)
+// ROUTES — Always serve login pages directly. No redirects. No bouncing.
 // ─────────────────────────────────────────
-app.get('/amazon', (req, res) => {
-  if (req.query.state && req.query.nonce) {
-    return renderPortalPage(req, res, 'amazon.html', 'amazon');
-  }
-  console.log('[AMAZON] No OIDC params → redirecting to Freshservice');
-  res.redirect(FRESHSERVICE_URL);
-});
-
-app.get('/netflix', (req, res) => {
-  if (req.query.state && req.query.nonce) {
-    return renderPortalPage(req, res, 'netflix.html', 'netflix');
-  }
-  console.log('[NETFLIX] No OIDC params → redirecting to Freshservice');
-  res.redirect(FRESHSERVICE_URL);
-});
-
-app.get('/', (req, res) => {
-  if (req.query.state && req.query.nonce) {
-    return renderPortalPage(req, res, 'amazon.html', 'amazon');
-  }
-  res.redirect(FRESHSERVICE_URL);
-});
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'amazon.html')));
+app.get('/amazon', (req, res) => res.sendFile(path.join(__dirname, 'public', 'amazon.html')));
+app.get('/netflix', (req, res) => res.sendFile(path.join(__dirname, 'public', 'netflix.html')));
 
 // ─────────────────────────────────────────
-// POST /login — authenticate and redirect to Freshworks with signed JWT
+// POST /login — validate creds → fetch OIDC params server-side → sign JWT → redirect
 // ─────────────────────────────────────────
-app.post('/login', (req, res) => {
-  const { email, password, portal, state, nonce } = req.body;
+app.post('/login', async (req, res) => {
+  const { email, password, portal } = req.body;
 
   console.log(`[LOGIN] email=${email} portal=${portal}`);
-  console.log(`  state=${state}`);
-  console.log(`  nonce=${nonce}`);
 
-  // GUARD 1: state and nonce MUST be present
-  if (!state || !nonce) {
-    console.error('[LOGIN] ❌ Missing state or nonce');
+  // GUARD 1: credentials must be provided
+  if (!email || !password) {
     return res.status(400).send(`
-      <!DOCTYPE html>
-      <html><head><title>Session Error</title>
+      <!DOCTYPE html><html><head><title>Error</title>
       <style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;background:#0d1117;color:#f0f0f0}
-      h2{color:#FF9900}a{color:#FF9900}</style></head>
-      <body>
-        <h2>Session expired or invalid entry</h2>
-        <p>The login session is missing required parameters.</p>
-        <p><a href="${FRESHSERVICE_URL}">→ Click here to start login</a></p>
-      </body></html>
+      h2{color:#ff6b6b}a{color:#FF9900}</style></head>
+      <body><h2>Email and password are required</h2>
+      <p><a href="javascript:history.back()">← Go back</a></p></body></html>
     `);
   }
 
-  // GUARD 2: credentials must be provided
-  if (!email || !password) {
-    return res.status(400).send('Email and password are required.');
-  }
-
-  // GUARD 3: agent must exist and password must match
+  // GUARD 2: agent must exist and password must match
   const agentKey = email.toLowerCase().trim();
   const agent = AGENTS[agentKey];
 
   if (!agent || agent.password !== password) {
     console.warn(`[LOGIN] ❌ Invalid credentials for ${agentKey}`);
     return res.status(401).send(`
-      <!DOCTYPE html>
-      <html><head><title>Login Failed</title>
+      <!DOCTYPE html><html><head><title>Login Failed</title>
       <style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;background:#0d1117;color:#f0f0f0}
       h2{color:#ff6b6b}a{color:#FF9900}</style></head>
-      <body>
-        <h2>Invalid email or password</h2>
-        <p><a href="javascript:history.back()">← Go back and try again</a></p>
-      </body></html>
+      <body><h2>Invalid email or password</h2>
+      <p><a href="javascript:history.back()">← Go back and try again</a></p></body></html>
     `);
   }
 
-  // GUARD 4: portal exclusivity
+  // GUARD 3: portal exclusivity
   if (portal && agent.workspace !== portal) {
     console.warn(`[LOGIN] ❌ Agent ${agentKey} (${agent.workspace}) tried to access ${portal} portal`);
     return res.status(403).send(`
-      <!DOCTYPE html>
-      <html><head><title>Access Denied</title>
+      <!DOCTYPE html><html><head><title>Access Denied</title>
       <style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;background:#0d1117;color:#f0f0f0}
       h2{color:#ff6b6b}a{color:#FF9900}</style></head>
-      <body>
-        <h2>Access Denied</h2>
-        <p>You are not authorized to access the <strong>${portal}</strong> portal.</p>
-        <p><a href="javascript:history.back()">← Go back</a></p>
-      </body></html>
+      <body><h2>Access Denied</h2>
+      <p>You are not authorized to access the <strong>${portal}</strong> portal.</p>
+      <p><a href="javascript:history.back()">← Go back</a></p></body></html>
     `);
   }
 
-  // Build JWT payload
+  // ─── Fetch OIDC state + nonce from Freshservice (server-side) ───
+  let state, nonce;
+  try {
+    console.log('[LOGIN] Fetching OIDC params from Freshservice...');
+    const params = await fetchOIDCParams();
+    state = params.state;
+    nonce = params.nonce;
+    console.log(`[LOGIN] ✅ Got state=${state.substring(0, 15)}... nonce=${nonce.substring(0, 15)}...`);
+  } catch (err) {
+    console.error('[LOGIN] ❌ Failed to fetch OIDC params:', err.message);
+    return res.status(500).send(`
+      <!DOCTYPE html><html><head><title>Connection Error</title>
+      <style>body{font-family:sans-serif;max-width:600px;margin:60px auto;padding:20px;background:#0d1117;color:#f0f0f0}
+      h2{color:#FF9900}a{color:#FF9900}</style></head>
+      <body><h2>Could not connect to Freshservice</h2>
+      <p>Please try again in a moment. If this keeps happening, contact support.</p>
+      <p><a href="javascript:history.back()">← Go back and retry</a></p></body></html>
+    `);
+  }
+
+  // ─── Build JWT ───
   const now = Math.floor(Date.now() / 1000);
   const payload = {
     sub: agentKey,
@@ -180,7 +226,6 @@ app.post('/login', (req, res) => {
 
   console.log('[LOGIN] JWT payload:', JSON.stringify(payload));
 
-  // Sign JWT
   let token;
   try {
     token = jwt.sign(payload, PRIVATE_KEY, { algorithm: 'RS256' });
@@ -189,9 +234,9 @@ app.post('/login', (req, res) => {
     return res.status(500).send('Authentication error. Please contact support.');
   }
 
-  // Redirect to Freshworks OIDC endpoint
+  // ─── Redirect to Freshworks OIDC endpoint ───
   const redirectUrl = `${OIDC_REDIRECT_URL}?state=${encodeURIComponent(state)}&id_token=${token}`;
-  console.log(`[LOGIN] ✅ Redirecting to Freshworks for ${agentKey}`);
+  console.log(`[LOGIN] ✅ Redirecting ${agentKey} to Freshworks dashboard`);
 
   return res.redirect(302, redirectUrl);
 });
