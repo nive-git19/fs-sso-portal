@@ -13,7 +13,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 // CONFIG — All settings in one place
 // ─────────────────────────────────────────
 const CONFIG = {
-  freshservice_url: 'https://nive-959766391470843394.myfreshworks.com',
+  freshservice_url: 'https://testott.freshservice.com',
 
   // Agents: email → { password, workspace }
   agents: {
