@@ -23,9 +23,6 @@ if (process.env.PRIVATE_KEY) {
   }
 }
 
-// ─────────────────────────────────────────
-// CONFIG — as per official Freshworks docs
-// ─────────────────────────────────────────
 const OIDC_REDIRECT_URL = 'https://nive-959766391470843394.myfreshworks.com/sp/OIDC/964459105499003173/implicit';
 
 const AGENTS = {
@@ -43,59 +40,77 @@ const AGENTS = {
   }
 };
 
-// Store state+nonce from Freshworks in memory
+// Server-side session store
+// Key: sessionId → { state, nonce, portal }
 const sessions = {};
 
 // ─────────────────────────────────────────
-// HELPER — Inject state+nonce into HTML
+// ROUTES
 // ─────────────────────────────────────────
-function serveHtml(res, filename, state, nonce) {
-  const filePath = path.join(__dirname, 'public', filename);
-  let html = fs.readFileSync(filePath, 'utf8');
-  html = html.replace(
-    '<!-- STATE_NONCE_PLACEHOLDER -->',
-    `<input type="hidden" name="state" value="${state || ''}"/>
-     <input type="hidden" name="nonce" value="${nonce || ''}"/>`
-  );
-  res.send(html);
-}
-
-// ─────────────────────────────────────────
-// ROUTES — capture state+nonce when
-// Freshworks redirects to our auth URL
-// ─────────────────────────────────────────
-app.get('/', (req, res) => {
-  const { state, nonce } = req.query;
-  if (state) sessions[state] = nonce;
-  serveHtml(res, 'amazon.html', state, nonce);
-});
-
 app.get('/amazon', (req, res) => {
   const { state, nonce } = req.query;
   console.log(`[AMAZON] state=${state} nonce=${nonce}`);
-  if (state) sessions[state] = nonce;
-  serveHtml(res, 'amazon.html', state, nonce);
+
+  // Create a session and store state+nonce
+  const sessionId = uuidv4();
+  sessions[sessionId] = { state, nonce, portal: 'amazon' };
+
+  // Serve HTML with sessionId injected
+  const filePath = path.join(__dirname, 'public', 'amazon.html');
+  let html = fs.readFileSync(filePath, 'utf8');
+  html = html.replace(
+    '<!-- SESSION_PLACEHOLDER -->',
+    `<input type="hidden" name="sessionId" value="${sessionId}"/>`
+  );
+  res.send(html);
 });
 
 app.get('/netflix', (req, res) => {
   const { state, nonce } = req.query;
   console.log(`[NETFLIX] state=${state} nonce=${nonce}`);
-  if (state) sessions[state] = nonce;
-  serveHtml(res, 'netflix.html', state, nonce);
+
+  const sessionId = uuidv4();
+  sessions[sessionId] = { state, nonce, portal: 'netflix' };
+
+  const filePath = path.join(__dirname, 'public', 'netflix.html');
+  let html = fs.readFileSync(filePath, 'utf8');
+  html = html.replace(
+    '<!-- SESSION_PLACEHOLDER -->',
+    `<input type="hidden" name="sessionId" value="${sessionId}"/>`
+  );
+  res.send(html);
+});
+
+app.get('/', (req, res) => {
+  const { state, nonce } = req.query;
+  const sessionId = uuidv4();
+  sessions[sessionId] = { state, nonce, portal: 'amazon' };
+
+  const filePath = path.join(__dirname, 'public', 'amazon.html');
+  let html = fs.readFileSync(filePath, 'utf8');
+  html = html.replace(
+    '<!-- SESSION_PLACEHOLDER -->',
+    `<input type="hidden" name="sessionId" value="${sessionId}"/>`
+  );
+  res.send(html);
 });
 
 // ─────────────────────────────────────────
-// POST /login — validate + sign JWT
+// POST /login
 // ─────────────────────────────────────────
 app.post('/login', (req, res) => {
-  let { email, password, portal, state, nonce } = req.body;
+  const { email, password, portal, sessionId } = req.body;
 
-  // Recover nonce from session storage if not in form
-  if (state && sessions[state] && !nonce) {
-    nonce = sessions[state];
-  }
+  // Retrieve state+nonce from server session
+  const session = sessions[sessionId] || {};
+  const state = session.state;
+  const nonce = session.nonce;
+  const sessionPortal = session.portal || portal;
 
-  console.log(`[LOGIN] email=${email} portal=${portal} state=${state} nonce=${nonce}`);
+  console.log(`[LOGIN] email=${email} sessionId=${sessionId} state=${state} nonce=${nonce} portal=${sessionPortal}`);
+
+  // Clean up session
+  if (sessionId) delete sessions[sessionId];
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
@@ -112,22 +127,21 @@ app.post('/login', (req, res) => {
     return res.status(401).json({ error: 'Invalid email or password.' });
   }
 
-  if (portal && agent.workspace !== portal) {
+  if (sessionPortal && agent.workspace !== sessionPortal) {
     return res.status(403).json({
-      error: `Access denied. You are not an agent for the ${portal} portal.`
+      error: `Access denied. You are not an agent for the ${sessionPortal} portal.`
     });
   }
 
-  // Build JWT payload — as per official Freshworks docs
   const now = Math.floor(Date.now() / 1000);
   const payload = {
     sub: agentKey,
     email: agentKey,
-    given_name: agent.given_name,   // ✅ Required by Freshworks
-    family_name: agent.family_name, // ✅ Required by Freshworks
+    given_name: agent.given_name,
+    family_name: agent.family_name,
     iat: now,
     exp: now + 300,
-    nonce: nonce || uuidv4()        // ✅ MUST be the nonce from Freshworks
+    nonce: nonce || uuidv4()
   };
 
   let token;
@@ -138,10 +152,9 @@ app.post('/login', (req, res) => {
     return res.status(500).json({ error: 'Authentication error.' });
   }
 
-  // Redirect back to Freshworks OIDC endpoint
-  // Format: OIDC_URL?state=STATE&id_token=JWT
-  const redirectUrl = `${OIDC_REDIRECT_URL}?state=${state || portal}&id_token=${token}`;
-  console.log(`[REDIRECT] state=${state} nonce=${nonce}`);
+  const finalState = state || sessionPortal;
+  const redirectUrl = `${OIDC_REDIRECT_URL}?state=${finalState}&id_token=${token}`;
+  console.log(`[REDIRECT] state=${finalState} nonce=${nonce}`);
 
   return res.json({ success: true, redirectUrl });
 });
