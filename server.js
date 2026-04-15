@@ -33,7 +33,7 @@ if (process.env.PRIVATE_KEY) {
 // ─────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────
-const FRESHSERVICE_REDIRECT_URL = 'https://nive-959766391470843394.myfreshworks.com/sp/OIDC/964246980516603282/implicit';
+const FRESHSERVICE_REDIRECT_URL = 'https://nive-959766391470843394.myfreshworks.com/sp/OIDC/964459105499003173/implicit';
 
 const AGENTS = {
   'niveditha@oskloud.com': { password: 'Nivedemo@1234', workspace: 'amazon' },
