@@ -28,26 +28,30 @@ if (process.env.PRIVATE_KEY) {
 const OIDC_REDIRECT_URL = 'https://nive-959766391470843394.myfreshworks.com/sp/OIDC/964459105499003173/implicit';
 
 // ─────────────────────────────────────────
-// Agent whitelist (server-side enforcement)
+// Agent whitelist
+// 'sub' is the Freshworks user ID — grabbed from Neo Admin Center URL
+// Niveditha: /users/962962783131722116/accounts
+// Netflix:   /users/959782866975283814/accounts
 // ─────────────────────────────────────────
 const AGENTS = {
   'niveditha@oskloud.com': {
     password: 'Nivedemo@1234',
     workspace: 'amazon',
     given_name: 'Niveditha',
-    family_name: 'Agent'
+    family_name: 'Agent',
+    sub: '962962783131722116'   // ← Niveditha's Freshworks user ID
   },
   'nivetestfw@gmail.com': {
     password: 'Nivedemo@1234',
     workspace: 'netflix',
     given_name: 'Netflix',
-    family_name: 'Agent'
+    family_name: 'Agent',
+    sub: '959782866975283814'   // ← Netflix Agent's Freshworks user ID
   }
 };
 
 // ─────────────────────────────────────────
 // Render branded portal page (IdP-initiated, no Freshworks handshake)
-// Agents come DIRECTLY to /amazon or /netflix
 // ─────────────────────────────────────────
 function renderPortalPage(req, res, htmlFileName, portalName) {
   console.log(`[${portalName.toUpperCase()}] Direct visit — IdP-initiated flow`);
@@ -64,7 +68,7 @@ function renderPortalPage(req, res, htmlFileName, portalName) {
 }
 
 // ─────────────────────────────────────────
-// Routes — agents come here directly via amazon-support.com / netflix-support.com
+// Routes — agents come here directly
 // ─────────────────────────────────────────
 app.get('/amazon', (req, res) => renderPortalPage(req, res, 'amazon.html', 'amazon'));
 app.get('/netflix', (req, res) => renderPortalPage(req, res, 'netflix.html', 'netflix'));
@@ -72,7 +76,6 @@ app.get('/', (req, res) => renderPortalPage(req, res, 'amazon.html', 'amazon'));
 
 // ─────────────────────────────────────────
 // POST /login — IdP-initiated SSO
-// We generate our own nonce. No Freshworks state/nonce echo.
 // ─────────────────────────────────────────
 app.post('/login', (req, res) => {
   const { email, password, portal } = req.body;
@@ -99,11 +102,14 @@ app.post('/login', (req, res) => {
     ));
   }
 
+  // ─────────────────────────────────────
+  // Build JWT — sub is the Freshworks user ID
+  // ─────────────────────────────────────
   const now = Math.floor(Date.now() / 1000);
   const ourNonce = crypto.randomBytes(16).toString('hex');
 
   const payload = {
-    sub: agentKey,
+    sub: agent.sub,                    // ← Freshworks user ID
     email: agentKey,
     given_name: agent.given_name,
     family_name: agent.family_name,
@@ -121,9 +127,8 @@ app.post('/login', (req, res) => {
     return res.status(500).send(errorPage('Authentication error', 'Please contact support.'));
   }
 
-  // IdP-initiated: just send the JWT, no state param
   const redirectUrl = `${OIDC_REDIRECT_URL}?id_token=${token}`;
-  console.log(`[LOGIN] ✅ Redirecting ${agentKey} to Freshworks (${agent.workspace} workspace)`);
+  console.log(`[LOGIN] ✅ Redirecting ${agentKey} (sub=${agent.sub}) to Freshworks`);
 
   return res.redirect(302, redirectUrl);
 });
